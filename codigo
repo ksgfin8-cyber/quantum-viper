@@ -1,0 +1,410 @@
+//@version=6
+indicator("Quantum Viper v1.5c – Producción", overlay=true)
+
+// ============================================
+// FUNCIONES AUXILIARES (DEBEN IR PRIMERO)
+// ============================================
+
+calculate_efficiency(window) =>
+    if bar_index < window + 2
+        0.5
+    else
+        start_price = close[window + 1]
+        end_price = close[1]
+        distance = math.abs(end_price - start_price)
+        traveled = 0.0
+        for i = 1 to window
+            traveled += math.abs(close[i] - close[i+1])
+        traveled > 0 ? distance / traveled : 0.0
+
+// ============================================
+// SECCIÓN 0: PARÁMETROS CORE (4 expuestos)
+// ============================================
+
+lambda_costs = input.float(0.85, "Lambda (memoria reliability)", group="Core", minval=0.7, maxval=0.95)
+beta_penalty = input.float(2.0, "Beta (penalización desacuerdo)", group="Core", minval=0.5, maxval=5.0)
+theta_gamma = input.float(0.3, "Umbral Γ (robustez mínima)", group="Core", minval=0.15, maxval=0.6)
+theta_nrt = input.float(0.5, "Umbral calidad transición", group="Core", minval=0.3, maxval=0.8)
+
+// ============================================
+// SECCIÓN 0b: PARÁMETROS AVANZADOS
+// ============================================
+
+threshold_er = input.float(0.6, "Umbral ER (eficiencia de tendencia)", group="Advanced", minval=0.3, maxval=0.9)
+threshold_vol = input.float(0.025, "Umbral volatilidad alta", group="Advanced", minval=0.01, maxval=0.05)
+threshold_atr = input.float(1.2, "Umbral expansión ATR", group="Advanced", minval=1.0, maxval=2.0)
+
+window_fast_min = input.int(5, "Mínimo ventana rápida", group="Advanced", minval=3, maxval=20)
+window_slow_min = input.int(10, "Mínimo ventana lenta", group="Advanced", minval=5, maxval=30)
+
+commission = input.float(0.001, "Comisión (0.1% default)", group="Advanced", minval=0.0001, maxval=0.005)
+slippage = input.float(0.0005, "Slippage (0.05% default)", group="Advanced", minval=0.0001, maxval=0.002)
+
+vigencia_nivel = input.int(20, "Vigencia niveles NRT (barras)", group="Advanced", minval=5, maxval=50)
+nrt_decay_threshold = input.float(0.5, "Caída support para invalidar NRT", group="Advanced", minval=0.3, maxval=0.8)
+
+// ============================================
+// SECCIÓN 0c: ADAPTACIÓN TIMEFRAME
+// ============================================
+
+get_minutes_per_bar() =>
+    period = timeframe.period
+    minutes = 0
+    if period == "1"
+        minutes := 1
+    else if period == "5"
+        minutes := 5
+    else if period == "15"
+        minutes := 15
+    else if period == "30"
+        minutes := 30
+    else if period == "60" or period == "1h"
+        minutes := 60
+    else if period == "120" or period == "2h"
+        minutes := 120
+    else if period == "240" or period == "4h"
+        minutes := 240
+    else if period == "D" or period == "1D"
+        minutes := 1440
+    else if period == "W" or period == "1W"
+        minutes := 10080
+    else if period == "M" or period == "1M"
+        minutes := 43200
+    else
+        minutes := 60  // fallback
+    minutes
+
+minutes_per_bar = get_minutes_per_bar()
+is_daily_or_higher = minutes_per_bar >= 1440
+
+window_fast = is_daily_or_higher ? math.max(3, math.round(720 / minutes_per_bar)) : math.max(window_fast_min, math.round(1440 / minutes_per_bar))
+window_slow = is_daily_or_higher ? math.max(6, math.round(1440 / minutes_per_bar)) : math.max(window_slow_min, math.round(2880 / minutes_per_bar))
+window_vol = math.max(8, math.round(2160 / minutes_per_bar))
+
+// ============================================
+// SECCIÓN 1: MATRICES DE RELIABILITY Y MEMORIA
+// ============================================
+
+var array<float> rel_1 = array.new_float(4, 0.5)
+var array<float> rel_2 = array.new_float(4, 0.5)
+var array<float> rel_3 = array.new_float(4, 0.5)
+
+var int a_1_prev = 0
+var int a_2_prev = 0
+var int a_3_prev = 0
+var int context_prev = 2
+var bool initialized = false
+
+// ============================================
+// SECCIÓN 2: ACTUALIZACIÓN CAUSAL DE RELIABILITY
+// ============================================
+
+if initialized and bar_index > window_slow
+    ret_realized = (close - close[1]) / close[1]
+    
+    if a_1_prev != 0
+        perf_1 = a_1_prev * ret_realized - commission - slippage
+        current_rel_1 = array.get(rel_1, context_prev)
+        new_rel_1 = lambda_costs * current_rel_1 + (1 - lambda_costs) * (perf_1 > 0 ? 1.0 : 0.0)
+        array.set(rel_1, context_prev, new_rel_1)
+    
+    if a_2_prev != 0
+        perf_2 = a_2_prev * ret_realized - commission - slippage
+        current_rel_2 = array.get(rel_2, context_prev)
+        new_rel_2 = lambda_costs * current_rel_2 + (1 - lambda_costs) * (perf_2 > 0 ? 1.0 : 0.0)
+        array.set(rel_2, context_prev, new_rel_2)
+    
+    if a_3_prev != 0
+        perf_3 = a_3_prev * ret_realized - commission - slippage
+        current_rel_3 = array.get(rel_3, context_prev)
+        new_rel_3 = lambda_costs * current_rel_3 + (1 - lambda_costs) * (perf_3 > 0 ? 1.0 : 0.0)
+        array.set(rel_3, context_prev, new_rel_3)
+
+initialized := true
+
+// ============================================
+// SECCIÓN 3: PERSPECTIVAS (CAUSALES)
+// ============================================
+
+ema_fast_1 = ta.ema(close[1], window_fast)
+ema_slow_1 = ta.ema(close[1], window_slow)
+trend_direction_1 = ema_fast_1 > ema_slow_1 ? 1 : ema_fast_1 < ema_slow_1 ? -1 : 0
+er_1 = calculate_efficiency(window_slow)
+mechanism_1_active = trend_direction_1 != 0 and er_1 > threshold_er
+vol_1 = ta.stdev(close[1], window_vol) / close[1]
+vol_norm_1 = math.min(vol_1 / 0.02, 1.0)
+Phi_1 = er_1 * (1 - vol_norm_1)
+Phi_1 := math.max(0.0, math.min(1.0, Phi_1))
+a_1 = mechanism_1_active ? trend_direction_1 : 0
+
+price_mean_2 = ta.sma(close[1], window_slow)
+price_std_2 = ta.stdev(close[1], window_slow)
+z_score_2 = price_std_2 > 0 ? (close[1] - price_mean_2) / price_std_2 : 0
+range_low_2 = ta.lowest(low[1], window_slow)
+range_high_2 = ta.highest(high[1], window_slow)
+range_pos_2 = range_high_2 != range_low_2 ? (close[1] - range_low_2) / (range_high_2 - range_low_2) : 0.5
+extreme_low_2 = z_score_2 < -1.5 and range_pos_2 < 0.2
+extreme_high_2 = z_score_2 > 1.5 and range_pos_2 > 0.8
+mechanism_2_active = extreme_low_2 or extreme_high_2
+phi_z_2 = 1 - math.min(math.abs(z_score_2) / 3, 1.0)
+phi_range_2 = 1 - math.abs(range_pos_2 - 0.5) * 2
+Phi_2 = phi_z_2 * phi_range_2
+Phi_2 := math.max(0.0, math.min(1.0, Phi_2))
+a_2 = extreme_low_2 ? 1 : extreme_high_2 ? -1 : 0
+
+atr_current_3 = ta.atr(window_vol)[1]
+atr_mean_3 = ta.sma(atr_current_3, window_slow)
+atr_percentile_3 = atr_mean_3 > 0 ? atr_current_3 / atr_mean_3 : 1.0
+cons_high_3 = ta.highest(high[1], window_fast)
+cons_low_3 = ta.lowest(low[1], window_fast)
+cons_range_3 = cons_high_3 - cons_low_3
+breakout_level_3 = cons_range_3 > 0 ? (close[1] - cons_low_3) / cons_range_3 : 0.5
+expanding_vol_3 = atr_percentile_3 > threshold_atr
+breakout_up_3 = expanding_vol_3 and breakout_level_3 > 0.7
+breakout_down_3 = expanding_vol_3 and breakout_level_3 < 0.3
+mechanism_3_active = breakout_up_3 or breakout_down_3
+phi_atr_3 = math.min(atr_percentile_3 / 1.5, 1.0)
+phi_breakout_3 = 1 - math.abs(breakout_level_3 - 0.5) * 2
+Phi_3 = phi_atr_3 * phi_breakout_3
+Phi_3 := math.max(0.0, math.min(1.0, Phi_3))
+a_3 = breakout_up_3 ? 1 : breakout_down_3 ? -1 : 0
+
+// ============================================
+// SECCIÓN 4: CONTEXTO Y WEIGHTED PHI
+// ============================================
+
+current_vol = ta.stdev(close[1], window_vol) / close[1]
+current_vol_high = current_vol > threshold_vol
+current_trending = er_1 > threshold_er
+
+context_current = current_trending and a_1 == 1 ? 0 :
+                  current_trending and a_1 == -1 ? 1 :
+                  current_vol_high ? 3 : 2
+
+rel_1_current = array.get(rel_1, context_current)
+rel_2_current = array.get(rel_2, context_current)
+rel_3_current = array.get(rel_3, context_current)
+
+weighted_phi_1 = Phi_1 * rel_1_current
+weighted_phi_2 = Phi_2 * rel_2_current
+weighted_phi_3 = Phi_3 * rel_3_current
+
+// ============================================
+// SECCIÓN 5: SUPPORT Y DECISIÓN MAJORITARIA
+// ============================================
+
+support_up = (a_1 == 1 ? weighted_phi_1 : 0.0) + 
+             (a_2 == 1 ? weighted_phi_2 : 0.0) + 
+             (a_3 == 1 ? weighted_phi_3 : 0.0)
+
+support_down = (a_1 == -1 ? weighted_phi_1 : 0.0) + 
+               (a_2 == -1 ? weighted_phi_2 : 0.0) + 
+               (a_3 == -1 ? weighted_phi_3 : 0.0)
+
+support_null = (a_1 == 0 ? weighted_phi_1 : 0.0) + 
+               (a_2 == 0 ? weighted_phi_2 : 0.0) + 
+               (a_3 == 0 ? weighted_phi_3 : 0.0)
+
+total_support = support_up + support_down + support_null
+max_support = math.max(math.max(support_up, support_down), support_null)
+
+support_dist_up = total_support > 0 ? support_up / total_support : 0.0
+support_dist_down = total_support > 0 ? support_down / total_support : 0.0
+support_dist_null = total_support > 0 ? support_null / total_support : 0.0
+
+// a_maj: reescrito sin ternario partido
+a_maj = 0
+if support_up > support_down and support_up > support_null
+    a_maj := 1
+else if support_down > support_up and support_down > support_null
+    a_maj := -1
+else
+    a_maj := 0
+
+support_ratio = total_support > 0 ? max_support / total_support : 0.0
+D_t = 1.0 - support_ratio
+
+phi_min_support = 1.0
+support_count = 0
+if a_1 == a_maj and a_maj != 0
+    phi_min_support := math.min(phi_min_support, weighted_phi_1)
+    support_count += 1
+if a_2 == a_maj and a_maj != 0
+    phi_min_support := math.min(phi_min_support, weighted_phi_2)
+    support_count += 1
+if a_3 == a_maj and a_maj != 0
+    phi_min_support := math.min(phi_min_support, weighted_phi_3)
+    support_count += 1
+phi_min_support := support_count > 0 ? phi_min_support : 0.0
+
+// ============================================
+// SECCIÓN 6: ALINEACIÓN SEMÁNTICA (HONESTA)
+// ============================================
+
+p1_momentum = trend_direction_1
+p3_momentum = breakout_up_3 ? 1 : breakout_down_3 ? -1 : 0
+p2_mr = extreme_low_2 ? 1 : extreme_high_2 ? -1 : 0
+
+alignment_base = (p1_momentum != 0 and p3_momentum != 0 and p1_momentum == p3_momentum) ? 1.0 :
+                 (p1_momentum != 0 or p3_momentum != 0) ? 0.7 : 0.5
+
+alignment_penalty = (p2_mr != 0 and (p1_momentum == -p2_mr or p3_momentum == -p2_mr)) ? 0.7 : 1.0
+
+semantic_score = alignment_base * alignment_penalty
+semantic_score := math.max(0.3, math.min(1.0, semantic_score))
+
+// ============================================
+// SECCIÓN 7: ROBUSTEZ Y DECISIÓN
+// ============================================
+
+Gamma_t = support_ratio * phi_min_support * semantic_score * math.exp(-beta_penalty * D_t)
+Gamma_t := math.max(0.0, math.min(1.0, Gamma_t))
+
+a_final = Gamma_t >= theta_gamma and support_ratio >= 0.6 ? a_maj : 0
+regime_name = a_maj == 1 ? "BULLISH_DOMINANT" :
+              a_maj == -1 ? "BEARISH_DOMINANT" : "FRAGMENTED"
+
+// ============================================
+// SECCIÓN 8: MOMENTUM TRANSITION STATE
+// ============================================
+
+T_state = (a_final == 1 and a_final[1] <= 0) ? 1 :
+          (a_final == -1 and a_final[1] >= 0) ? -1 :
+          0
+
+Q_T = (T_state != 0) ? Gamma_t * support_ratio * semantic_score : 0.0
+
+// ============================================
+// SECCIÓN 9: NRT (CAUSAL Y CONFIGURABLE)
+// ============================================
+
+var float nivel_ref_bull = na
+var float nivel_ref_bear = na
+var int vigencia_bull = 0
+var int vigencia_bear = 0
+
+if T_state == 1 and Q_T >= theta_nrt
+    nivel_ref_bull := low[1]
+    vigencia_bull := vigencia_nivel
+else if T_state == -1 and Q_T >= theta_nrt
+    nivel_ref_bear := high[1]
+    vigencia_bear := vigencia_nivel
+
+vigencia_bull := vigencia_bull > 0 ? vigencia_bull - 1 : 0
+vigencia_bear := vigencia_bear > 0 ? vigencia_bear - 1 : 0
+
+if not na(nivel_ref_bull) and support_up < support_up[5] * nrt_decay_threshold
+    nivel_ref_bull := na
+    vigencia_bull := 0
+
+if not na(nivel_ref_bear) and support_down < support_down[5] * nrt_decay_threshold
+    nivel_ref_bear := na
+    vigencia_bear := 0
+
+// ============================================
+// SECCIÓN 10: VISUALIZACIÓN
+// ============================================
+
+show_panel = input.bool(true, "Panel informativo", group="Display")
+show_nrt = input.bool(true, "Niveles de transición", group="Display")
+
+plotshape(T_state == 1, title="Transición Alcista", location=location.belowbar,
+         style=shape.triangleup, size=size.tiny, color=color.new(color.green, 50))
+plotshape(T_state == -1, title="Transición Bajista", location=location.abovebar,
+         style=shape.triangledown, size=size.tiny, color=color.new(color.red, 50))
+
+plot(show_nrt and not na(nivel_ref_bull) ? nivel_ref_bull : na,
+     title="Zona Referencia Alcista", color=color.new(color.green, 30),
+     style=plot.style_line, linewidth=1)
+plot(show_nrt and not na(nivel_ref_bear) ? nivel_ref_bear : na,
+     title="Zona Referencia Bajista", color=color.new(color.red, 30),
+     style=plot.style_line, linewidth=1)
+
+// ============================================
+// SECCIÓN 11: PANEL INFORMATIVO
+// ============================================
+
+if show_panel and barstate.islast
+    var table panel = table.new(position.top_right, 2, 18,
+                              bgcolor=color.new(color.black, 80),
+                              border_width=1, border_color=color.gray)
+    
+    table.cell(panel, 0, 0, "QUANTUM VIPER", text_color=color.white,
+              text_size=size.normal, bgcolor=color.new(color.purple, 70))
+    table.cell(panel, 1, 0, "v1.5c", text_color=color.white, text_size=size.normal)
+    
+    table.cell(panel, 0, 1, "── Config ──", text_color=color.yellow, text_size=size.small)
+    table.cell(panel, 1, 1, "", text_color=color.yellow, text_size=size.small)
+    table.cell(panel, 0, 2, "Windows F/S:", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 2, str.tostring(window_fast) + "/" + str.tostring(window_slow),
+              text_color=color.white, text_size=size.small)
+    
+    table.cell(panel, 0, 3, "── Support ──", text_color=color.yellow, text_size=size.small)
+    table.cell(panel, 1, 3, "", text_color=color.yellow, text_size=size.small)
+    
+    table.cell(panel, 0, 4, "Baj/Neut/Alc:", text_color=color.gray, text_size=size.small)
+    sup_str = str.tostring(support_dist_down * 100, "#") + "/" + 
+              str.tostring(support_dist_null * 100, "#") + "/" + 
+              str.tostring(support_dist_up * 100, "#")
+    table.cell(panel, 1, 4, sup_str + "%", text_color=color.white, text_size=size.small)
+    
+    table.cell(panel, 0, 5, "Claridad:", text_color=color.gray, text_size=size.small)
+    claridad_color = support_ratio > 0.8 ? color.green : support_ratio > 0.6 ? color.yellow : color.red
+    table.cell(panel, 1, 5, str.tostring(support_ratio, "#.00"), text_color=claridad_color, text_size=size.small)
+    
+    table.cell(panel, 0, 6, "── Semántica ──", text_color=color.yellow, text_size=size.small)
+    table.cell(panel, 1, 6, "", text_color=color.yellow, text_size=size.small)
+    
+    table.cell(panel, 0, 7, "Alineación:", text_color=color.gray, text_size=size.small)
+    align_color = semantic_score > 0.8 ? color.green : semantic_score > 0.6 ? color.yellow : color.red
+    table.cell(panel, 1, 7, str.tostring(semantic_score, "#.00"), text_color=align_color, text_size=size.small)
+    
+    compat_str = (p1_momentum == p3_momentum and p1_momentum != 0) ? "P1=P3" : "P1≠P3"
+    if p2_mr != 0 and (p1_momentum == -p2_mr or p3_momentum == -p2_mr)
+        compat_str += "|P2⇅"
+    table.cell(panel, 0, 8, "Compat:", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 8, compat_str, text_color=color.white, text_size=size.small)
+    
+    table.cell(panel, 0, 9, "── Robustez ──", text_color=color.yellow, text_size=size.small)
+    table.cell(panel, 1, 9, "", text_color=color.yellow, text_size=size.small)
+    
+    table.cell(panel, 0, 10, "Γ(t):", text_color=color.gray, text_size=size.small)
+    g_color = Gamma_t >= theta_gamma ? color.green : color.red
+    table.cell(panel, 1, 10, str.tostring(Gamma_t, "#.00"), text_color=g_color, text_size=size.small)
+    
+    table.cell(panel, 0, 11, "Régimen:", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 11, regime_name, text_color=color.white, text_size=size.small)
+    
+    table.cell(panel, 0, 12, "Decisión:", text_color=color.white, text_size=size.normal)
+    decision_str = a_final == 1 ? "BULLISH" : a_final == -1 ? "BEARISH" : "NULL"
+    decision_color = a_final == 1 ? color.green : a_final == -1 ? color.red : color.gray
+    table.cell(panel, 1, 12, decision_str, text_color=decision_color, text_size=size.normal)
+    
+    table.cell(panel, 0, 13, "── Transición ──", text_color=color.yellow, text_size=size.small)
+    table.cell(panel, 1, 13, "", text_color=color.yellow, text_size=size.small)
+    
+    mts_str = T_state == 1 ? "ALCISTA" : T_state == -1 ? "BAJISTA" : "ESTABLE"
+    mts_color = T_state != 0 ? (T_state == 1 ? color.green : color.red) : color.gray
+    table.cell(panel, 0, 14, "T_state:", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 14, mts_str, text_color=mts_color, text_size=size.small)
+    
+    table.cell(panel, 0, 15, "Q_T:", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 15, str.tostring(Q_T, "#.000"),
+              text_color=Q_T > theta_nrt ? color.green : color.gray, text_size=size.small)
+    
+    nrt_str = not na(nivel_ref_bull) ? "ZONA_ALCISTA" : not na(nivel_ref_bear) ? "ZONA_BAJISTA" : "NINGUNA"
+    nrt_color = not na(nivel_ref_bull) ? color.green : not na(nivel_ref_bear) ? color.red : color.gray
+    table.cell(panel, 0, 16, "NRT:", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 16, nrt_str, text_color=nrt_color, text_size=size.small)
+    
+    table.cell(panel, 0, 17, "✓ Producción Ready", text_color=color.green, text_size=size.small)
+    table.cell(panel, 1, 17, str.tostring(minutes_per_bar) + "m", text_color=color.green, text_size=size.small)
+
+// ============================================
+// SECCIÓN 12: GUARDAR ESTADO
+// ============================================
+
+a_1_prev := a_1
+a_2_prev := a_2
+a_3_prev := a_3
+context_prev := context_current
