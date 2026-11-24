@@ -4,12 +4,17 @@
 
 ## Estado de la versión
 
-La versión de Quantum Viper objeto de la caracterización del propietario queda **congelada**. Esta decisión registra el estado del candidato existente y precede al trabajo de una nueva generación.
+El propietario declara **congelada la versión Quantum Viper v1.7.1 – TITAN Refinado**, identificada en su [auditoría interdisciplinaria](../research/QUANTUM_VIPER_V1_7_1_AUDITORIA_INTERDISCIPLINARIA.docx). La decisión precede al trabajo de una generación posterior. La auditoría se incorpora en su formato original. Su SHA-256 es `a254c62296f188cf94c5f28ba673dcb22eab68f200c86306800d30e1cf636c2d`.
 
-La referencia del repositorio al registrar la decisión es `main@9178a4978812615a605324af0ef0dfb1b0a6f56f`. El archivo `codigo` tiene el blob Git `5e21d7117aeccd8323296155623e3dafd6d63b59`. El [expediente QV-R01](../research/QUANTUM_VIPER_RDL_PB_001_EVALUATION.md) identifica este mismo blob como el candidato Pine v1.5c que examinó. La identidad del candidato citado en la auditoría interdisciplinaria del propietario debe cotejarse con el manuscrito al incorporarlo.
+## Identidad de los expedientes
 
-## Uso de la caracterización
+| Expediente | Objeto y procedencia |
+| --- | --- |
+| Auditoría interdisciplinaria del propietario | El manuscrito identifica como base el código v1.7.1 suministrado para su preparación. |
+| [QV-R01](../research/QUANTUM_VIPER_RDL_PB_001_EVALUATION.md) | Estudió el candidato Pine v1.5c. El archivo `codigo` del repositorio en `9178a4978812615a605324af0ef0dfb1b0a6f56f` tiene el blob Git `5e21d7117aeccd8323296155623e3dafd6d63b59`, el mismo que identifica QV-R01. |
 
-La caracterización interdisciplinaria del propietario se destina a orientar **una generación posterior**. Sus observaciones, preguntas y propuestas sirven para formular requisitos e hipótesis del nuevo candidato. Las afirmaciones sobre el alcance de las pruebas conservan la versión y las condiciones de sus fuentes.
+La correspondencia entre el código suministrado para la auditoría v1.7.1 y el blob de v1.5c queda por cotejar. Cada resultado se atribuye a la versión y a las condiciones del expediente que lo produce.
 
-La congelación expresa una decisión de versión. Una versión posterior tendrá identidad, requisitos y evidencia propios.
+## Uso en la siguiente generación
+
+La auditoría interdisciplinaria y QV-R01 sirven para formular requisitos e hipótesis de un candidato posterior. Esa generación se identificará y evaluará con sus propios requisitos, comparadores y evidencias.
